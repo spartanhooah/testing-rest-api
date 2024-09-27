@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+const refreshCookieName = "__Host-refresh_token"
+
 type Credentials struct {
 	Username string `json:"email"`
 	Password string `json:"password"`
@@ -44,15 +46,27 @@ func (app *Application) authenticate(resp http.ResponseWriter, req *http.Request
 	}
 
 	// generate token
-	tokenPairs, err := app.generateTokenPair(user)
+	tokenPair, err := app.generateTokenPair(user)
 
 	if err != nil {
 		app.errorJSON(resp, errors.New("Unauthorized"), http.StatusUnauthorized)
 		return
 	}
 
+	http.SetCookie(resp, &http.Cookie{
+		Name:     refreshCookieName,
+		Value:    tokenPair.RefreshToken,
+		Path:     "/",
+		Domain:   "localhost",
+		Expires:  time.Now().Add(RefreshTokenExpiry),
+		MaxAge:   int(RefreshTokenExpiry),
+		Secure:   true,
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
+
 	// send token to user
-	_ = app.writeJSON(resp, http.StatusOK, tokenPairs)
+	_ = app.writeJSON(resp, http.StatusOK, tokenPair)
 }
 
 func (app *Application) refresh(resp http.ResponseWriter, req *http.Request) {
@@ -103,7 +117,7 @@ func (app *Application) refresh(resp http.ResponseWriter, req *http.Request) {
 	}
 
 	http.SetCookie(resp, &http.Cookie{
-		Name:     "__Host-refresh_token",
+		Name:     refreshCookieName,
 		Value:    tokenPair.RefreshToken,
 		Path:     "/",
 		Domain:   "localhost",
@@ -115,6 +129,68 @@ func (app *Application) refresh(resp http.ResponseWriter, req *http.Request) {
 	})
 
 	_ = app.writeJSON(resp, http.StatusOK, tokenPair)
+}
+
+func (app *Application) refreshUsingCookie(resp http.ResponseWriter, req *http.Request) {
+	for _, cookie := range req.Cookies() {
+		if cookie.Name == refreshCookieName {
+			claims := &Claims{}
+			refreshToken := cookie.Value
+
+			_, err := jwt.ParseWithClaims(refreshToken, claims, func(token *jwt.Token) (any, error) {
+				return []byte(app.JWTSecret), nil
+			})
+
+			if err != nil {
+				app.errorJSON(resp, err, http.StatusBadRequest)
+				return
+			}
+
+			//if time.Unix(claims.ExpiresAt.Unix(), 0).Sub(time.Now()) > 30*time.Second {
+			//	app.errorJSON(resp, errors.New("refresh token does not to be renewed yet"), http.StatusTooEarly)
+			//	return
+			//}
+
+			userID, err := strconv.Atoi(claims.Subject)
+
+			if err != nil {
+				app.errorJSON(resp, err, http.StatusBadRequest)
+				return
+			}
+
+			user, err := app.DB.GetUser(userID)
+
+			if err != nil {
+				app.errorJSON(resp, errors.New("Unknown user"), http.StatusBadRequest)
+				return
+			}
+
+			tokenPair, err := app.generateTokenPair(user)
+
+			if err != nil {
+				app.errorJSON(resp, err, http.StatusBadRequest)
+				return
+			}
+
+			http.SetCookie(resp, &http.Cookie{
+				Name:     refreshCookieName,
+				Value:    tokenPair.RefreshToken,
+				Path:     "/",
+				Domain:   "localhost",
+				Expires:  time.Now().Add(RefreshTokenExpiry),
+				MaxAge:   int(RefreshTokenExpiry),
+				Secure:   true,
+				HttpOnly: true,
+				SameSite: http.SameSiteStrictMode,
+			})
+
+			// respond with JSON
+			_ = app.writeJSON(resp, http.StatusOK, tokenPair)
+			return
+		}
+	}
+
+	app.errorJSON(resp, errors.New("Unauthorized"), http.StatusUnauthorized)
 }
 
 func (app *Application) allUsers(resp http.ResponseWriter, req *http.Request) {
@@ -202,4 +278,20 @@ func (app *Application) createUser(resp http.ResponseWriter, req *http.Request) 
 	}
 
 	_ = app.writeJSON(resp, http.StatusCreated, user)
+}
+
+func (app *Application) deleteRefreshCookie(resp http.ResponseWriter, req *http.Request) {
+	http.SetCookie(resp, &http.Cookie{
+		Name:     refreshCookieName,
+		Value:    "",
+		Path:     "/",
+		Domain:   "localhost",
+		Expires:  time.Unix(0, 0),
+		MaxAge:   -1,
+		Secure:   true,
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
+
+	resp.WriteHeader(http.StatusAccepted)
 }
